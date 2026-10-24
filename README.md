@@ -103,10 +103,11 @@ autoprimecert.exe --count 100 --workers 2 --max-retries 10 --recent-maxlen 500
 
   ```
   [Comments]
-  Uploaded by auto primecert tool v0.1 via cypari v2.5.7
+  Uploaded by auto primecert tool vx.x via cypari vx.x
   https://github.com/LezheGao/auto-prime-cert-tool
   ```
 
+（x.x为版本号）
   其余 `[Candidate]`、各 `[...]` 数学数据保持 cypari 原样输出。
 
 ### 环境变量
@@ -239,10 +240,11 @@ autoprimecert.exe --count 100 --workers 2 --max-retries 10 --recent-maxlen 500
 
   ```
   [Comments]
-  Uploaded by auto primecert tool v0.1 via cypari v2.5.7
+  Uploaded by auto primecert tool vx.x via cypari vx.x
   https://github.com/LezheGao/auto-prime-cert-tool
   ```
 
+(x.x is the version number)
   All mathematical data (`[Candidate]`, `[1]`, etc.) is left as produced by cypari.
 
 ### Environment Variables
