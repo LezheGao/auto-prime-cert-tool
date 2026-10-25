@@ -57,7 +57,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # Tool version / repository (used in User-Agent and certificate comments).
-TOOL_VERSION = "0.2"
+TOOL_VERSION = "1.0"
 REPO_URL = "https://github.com/LezheGao/auto-prime-cert-tool"
 
 # FactorDB JSON-RPC endpoint.
@@ -91,6 +91,9 @@ MESSAGES = {
     "err_cypari_missing": ("cypari 未安装或导入失败，请运行: pip install cypari",
                            "cypari not installed or import failed. Run: pip install cypari"),
     "err_cypari_init": ("cypari 初始化失败: {err}", "cypari init failed: {err}"),
+
+    "workers_capped": ("workers 从 {orig} 下调为 {eff}（不超过任务数 {count}）",
+                       "Workers reduced from {orig} to {eff} (no more than task count {count})"),
 
     "cfg_summary_title": ("===== 配置摘要 =====", "===== Config Summary ====="),
     "cfg_output_dir": ("输出目录", "Output dir"),
@@ -219,7 +222,8 @@ def parse_args(argv=None):
     p.add_argument("--email", default=None,
                    help="Contact email appended to User-Agent as mailto (optional)")
     p.add_argument("--workers", type=int, default=5,
-                   help="Number of worker processes (default: 5)")
+                   help="Number of worker processes (default: 5; "
+                        "capped at --count in finite mode)")
     p.add_argument("--max-retries", type=int, default=5,
                    help="Max upload retries on transient failures (default: 5)")
     p.add_argument("--base-backoff", type=float, default=2.0,
@@ -688,9 +692,14 @@ def run_pipeline(cfg):
                         # Queue is full; wait before polling again.
                         time.sleep(0.5)
                         continue
-                    if target is not None and stats.snapshot()[0] >= target:
+                    # Snapshot how many tasks are already queued so far.
+                    current_added = stats.snapshot()[0]
+                    if target is not None and current_added >= target:
                         break
                     need = cfg['queue_size'] - len(in_flight)
+                    # In finite mode, never ask for more than what's left.
+                    if target is not None:
+                        need = min(need, target - current_added)
 
                 # Request roughly twice the needed count, clamped to [8, 60].
                 request_count = min(max(need * 2, 8), 60)
@@ -719,6 +728,10 @@ def run_pipeline(cfg):
 
                     added = skipped = 0
                     with in_flight_lock:
+                        # Re-read the current total under the lock so the
+                        # target boundary below is enforced per item, not
+                        # just once per batch.
+                        current_added = stats.snapshot()[0]
                         for item in nums:
                             fid = item['fid']
                             # Skip fids already in flight or recently completed.
@@ -727,6 +740,9 @@ def run_pipeline(cfg):
                                 skipped += 1
                                 continue
                             if len(in_flight) >= cfg['queue_size']:
+                                break
+                            # Do not exceed --count in finite mode.
+                            if target is not None and current_added + added >= target:
                                 break
                             try:
                                 task_q.put_nowait(item)
@@ -843,11 +859,23 @@ def collect_config(args):
     cfg['count'] = args.count
     cfg['loop_mode'] = (args.count is None)
 
+    # Validate workers early; later logic assumes a positive value.
+    if cfg['upload_workers'] <= 0:
+        sys.exit(t("err_workers_positive"))
+
     if cfg['count'] is not None:
         if cfg['count'] <= 0:
             sys.exit(t("err_count_positive"))
         if cfg['count'] > 32000:
             sys.exit(t("err_count_max"))
+        # Cap workers to the task count: more workers than tasks is wasted
+        # PARI instances (and memory) that would never receive work.
+        if cfg['upload_workers'] > cfg['count']:
+            log.info(t("workers_capped",
+                       orig=cfg['upload_workers'],
+                       eff=cfg['count'],
+                       count=cfg['count']))
+            cfg['upload_workers'] = cfg['count']
 
     if args.queue_size is not None:
         cfg['queue_size'] = args.queue_size
@@ -862,8 +890,6 @@ def collect_config(args):
     cfg['debug_log'] = args.debug
     logging.getLogger().setLevel(logging.DEBUG if cfg['debug_log'] else logging.INFO)
 
-    if cfg['upload_workers'] <= 0:
-        sys.exit(t("err_workers_positive"))
     if cfg['queue_size'] <= 0:
         sys.exit(t("err_queue_positive"))
 
