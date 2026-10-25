@@ -57,7 +57,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # Tool version / repository (used in User-Agent and certificate comments).
-TOOL_VERSION = "0.1"
+TOOL_VERSION = "0.2"
 REPO_URL = "https://github.com/LezheGao/auto-prime-cert-tool"
 
 # FactorDB JSON-RPC endpoint.
@@ -391,12 +391,16 @@ def ecpp_with_pari(n_decimal):
 def _rewrite_cert_comments(cert_str):
     """Replace the [Comments] block of a certificate with our attribution.
 
+    The trailing '\\n' after REPO_URL preserves the blank line that PARI
+    emits between [Comments] and the next section (e.g. [Candidate]);
+    dropping it would produce a non-conforming Primo .out file.
+
     If the certificate has no [Comments] section (e.g. produced by an
     unexpected export format), the input is returned unchanged.
     """
     new_comment = (
         f"Uploaded by auto primecert tool v{TOOL_VERSION} via cypari v{CYPAI_VERSION}\n"
-        f"{REPO_URL}"
+        f"{REPO_URL}\n"
     )
     pat = re.compile(r"(\[Comments\]\n).*?(?=\n\[)", re.S)
     return pat.sub(lambda m: m.group(1) + new_comment, cert_str, count=1)
@@ -929,5 +933,9 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    # Script entry point.
+    # PyInstaller + multiprocessing spawn fix: on Windows, freeze_support()
+    # intercepts the internal --multiprocessing-fork launch and dispatches
+    # directly to spawn_main(), so the child never re-enters main()/argparse.
+    # No-op when running from source.
+    mp.freeze_support()
     main()
