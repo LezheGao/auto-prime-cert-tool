@@ -518,9 +518,8 @@ class PipelineStats:
       - done_total:  tasks that have finished processing (worker reported
                      a 'done' event, regardless of success or failure).
 
-    The difference (added_total - done_total) minus the current in-flight
-    count is what's still sitting in the queue; in-flight is tracked
-    externally by run_pipeline.
+    In-flight tasks are exactly those enqueued but not yet done, so
+    len(in_flight) tracks added_total - done_total.
     """
 
     def __init__(self, target):
