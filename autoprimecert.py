@@ -771,7 +771,7 @@ def run_pipeline(cfg):
                             in_flight.add(fid)
                             added += 1
 
-                    # Update counters and read both totals atomically.
+                    # Update counters, then read the done total.
                     total_queued = stats.record_added(added, skipped)
                     _, total_done, _ = stats.progress()
                     if target is not None:
