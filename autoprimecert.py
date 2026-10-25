@@ -57,7 +57,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # Tool version / repository (used in User-Agent and certificate comments).
-TOOL_VERSION = "1.0"
+TOOL_VERSION = "1.1"
 REPO_URL = "https://github.com/LezheGao/auto-prime-cert-tool"
 
 # FactorDB JSON-RPC endpoint.
@@ -136,8 +136,8 @@ MESSAGES = {
                       "[Fetcher] {n} consecutive duplicate fids, waiting FactorDB update, retry in {wait}s"),
     "fetch_single_no_new": ("[Fetcher] 单次模式：连续 {n} 次无新 fid，实际只入队 {total}/{target} 个，退出等待",
                             "[Fetcher] Single mode: {n} consecutive no-new-fid, enqueued {total}/{target}, exit"),
-    "fetch_added": ("[Fetcher] 加入 {added}（跳过 {skipped}），累计 {total}{suffix}",
-                    "[Fetcher] Added {added} (skipped {skipped}), total {total}{suffix}"),
+    "fetch_added": ("[Fetcher] 本轮入队 {added}（跳过 {skipped}）| 累计入队 {queued}，累计完成 {done}",
+                    "[Fetcher] Enqueued {added} (skipped {skipped}) | queued {queued}, done {done}"),
     "fetch_error": ("[Fetcher] 获取失败: {err}", "[Fetcher] Fetch error: {err}"),
     "fetch_retry_5s": ("[Fetcher] 5s 后重试", "[Fetcher] Retry in 5s"),
 
@@ -159,7 +159,8 @@ MESSAGES = {
     "w_up_fail": ("[{tag}] UP   FAIL {name} -> {err}", "[{tag}] UP   FAIL {name} -> {err}"),
 
     "stats_title": ("===== 统计 =====", "===== Stats ====="),
-    "stats_added": ("  新入队任务     : {n}", "  New tasks       : {n}"),
+    "stats_added": ("  累计入队任务   : {n}", "  Total enqueued  : {n}"),
+    "stats_done": ("  累计完成任务   : {n}", "  Total completed : {n}"),
     "stats_skipped": ("  跳过重复 fid   : {n}", "  Skipped dups    : {n}"),
     "stats_pool": ("  在途任务       : {u}，recent_done={r}",
                    "  In-flight       : {u}, recent_done={r}"),
@@ -508,12 +509,24 @@ def worker_main(wid, task_q, result_q, stop_event, cfg):
 # ==================== Statistics ====================
 
 class PipelineStats:
-    """Thread-safe counters for pipeline progress and failed items."""
+    """Thread-safe counters for pipeline progress and failed items.
+
+    Two cumulative counters track different concepts and are deliberately
+    kept separate so log lines can distinguish them:
+
+      - added_total: tasks that have been put onto task_q (enqueued).
+      - done_total:  tasks that have finished processing (worker reported
+                     a 'done' event, regardless of success or failure).
+
+    In-flight tasks are exactly those enqueued but not yet done, so
+    len(in_flight) tracks added_total - done_total.
+    """
 
     def __init__(self, target):
         self.target = target
         self.lock = threading.Lock()
         self.added_total = 0
+        self.done_total = 0
         self.skipped_total = 0
         self.gen_ok = 0
         self.gen_fail = 0
@@ -521,9 +534,10 @@ class PipelineStats:
         self.upload_fail = 0
         self.failed_paths = []
 
-    def target_suffix(self):
-        """Format as '/target' when finite, or '' in infinite mode."""
-        return f"/{self.target}" if self.target is not None else ""
+    def progress(self):
+        """Atomically return (added_total, done_total, skipped_total)."""
+        with self.lock:
+            return self.added_total, self.done_total, self.skipped_total
 
     def record_added(self, n, skipped):
         """Record newly queued tasks and skipped duplicates; return running total."""
@@ -531,6 +545,11 @@ class PipelineStats:
             self.added_total += n
             self.skipped_total += skipped
             return self.added_total
+
+    def record_done(self):
+        """Mark one task as finished (success or failure)."""
+        with self.lock:
+            self.done_total += 1
 
     def record_gen_ok(self):
         with self.lock:
@@ -555,7 +574,7 @@ class PipelineStats:
     def snapshot(self):
         """Return an atomic snapshot of all counters and failed items."""
         with self.lock:
-            return (self.added_total, self.skipped_total,
+            return (self.added_total, self.done_total, self.skipped_total,
                     self.gen_ok, self.gen_fail,
                     self.upload_ok, self.upload_fail,
                     list(self.failed_paths))
@@ -563,9 +582,11 @@ class PipelineStats:
 
 def print_stats(stats, in_flight_size, recent_size):
     """Log a human-readable summary of pipeline statistics."""
-    added, skipped, gen_ok, gen_fail, up_ok, up_fail, failed = stats.snapshot()
+    (added, done, skipped, gen_ok, gen_fail,
+     up_ok, up_fail, failed) = stats.snapshot()
     log.info(t("stats_title"))
     log.info(t("stats_added", n=added))
+    log.info(t("stats_done", n=done))
     log.info(t("stats_skipped", n=skipped))
     log.info(t("stats_pool", u=in_flight_size, r=recent_size))
     log.info(t("stats_gen_ok", n=gen_ok))
@@ -581,20 +602,16 @@ def print_stats(stats, in_flight_size, recent_size):
 # ==================== Result collector thread ====================
 
 def result_collector(result_q, stop_event, stats, in_flight, in_flight_lock,
-                     recent_done, n_workers):
-    """Main-process thread consuming worker events.
-
-    Updates stats, removes finished fids from in_flight (and adds them to
-    recent_done on success), and emits the only log lines for worker events.
-    """
+                     recent_done, n_workers, procs):
+    """Main-process thread consuming worker events."""
     exited = 0
     while True:
         try:
             ev = result_q.get(timeout=0.5)
         except queue.Empty:
-            # Exit when all workers have gone away and the queue is drained.
+            workers_gone = all(not p.is_alive() for p in procs)
             if (exited >= n_workers and result_q.empty()) or (
-                    stop_event.is_set() and result_q.empty()):
+                    stop_event.is_set() and workers_gone and result_q.empty()):
                 time.sleep(0.2)
                 if result_q.empty():
                     break
@@ -629,6 +646,8 @@ def result_collector(result_q, stop_event, stats, in_flight, in_flight_lock,
                 in_flight.discard(ev['fid'])
                 if ev.get('success') and recent_done is not None:
                     recent_done.append(ev['fid'])
+            # Count completion exactly once per task (success or failure).
+            stats.record_done()
         elif typ == 'worker_exit':
             # (Reserved: workers do not emit this event in the current design.)
             exited += 1
@@ -676,7 +695,7 @@ def run_pipeline(cfg):
     collector = threading.Thread(
         target=result_collector,
         args=(result_q, stop_event, stats, in_flight, in_flight_lock,
-              recent_done, n_workers),
+              recent_done, n_workers, procs),
         name='collector', daemon=True,
     )
     collector.start()
@@ -692,8 +711,8 @@ def run_pipeline(cfg):
                         # Queue is full; wait before polling again.
                         time.sleep(0.5)
                         continue
-                    # Snapshot how many tasks are already queued so far.
-                    current_added = stats.snapshot()[0]
+                    # Snapshot how many tasks have been enqueued so far.
+                    current_added = stats.progress()[0]
                     if target is not None and current_added >= target:
                         break
                     need = cfg['queue_size'] - len(in_flight)
@@ -731,7 +750,7 @@ def run_pipeline(cfg):
                         # Re-read the current total under the lock so the
                         # target boundary below is enforced per item, not
                         # just once per batch.
-                        current_added = stats.snapshot()[0]
+                        current_added = stats.progress()[0]
                         for item in nums:
                             fid = item['fid']
                             # Skip fids already in flight or recently completed.
@@ -751,7 +770,15 @@ def run_pipeline(cfg):
                             in_flight.add(fid)
                             added += 1
 
-                    total = stats.record_added(added, skipped)
+                    # Update counters, then read the done total.
+                    total_queued = stats.record_added(added, skipped)
+                    _, total_done, _ = stats.progress()
+                    if target is not None:
+                        queued_str = f"{total_queued}/{target}"
+                        done_str = f"{total_done}/{target}"
+                    else:
+                        queued_str = str(total_queued)
+                        done_str = str(total_done)
 
                     if added == 0:
                         # Entire batch was duplicates; back off and retry.
@@ -768,7 +795,7 @@ def run_pipeline(cfg):
                         if target is not None and consecutive_all_dup >= 10:
                             log.warning(t("fetch_single_no_new",
                                           n=consecutive_all_dup,
-                                          total=total, target=target))
+                                          total=total_queued, target=target))
                             break
                         time.sleep(wait)
                         continue
@@ -776,10 +803,10 @@ def run_pipeline(cfg):
                     consecutive_all_dup = 0
                     log.info(t("fetch_added",
                                added=added, skipped=skipped,
-                               total=total, suffix=stats.target_suffix()))
+                               queued=queued_str, done=done_str))
                 except Exception as e:
                     log.error(t("fetch_error", err=e))
-                    if target is not None and stats.snapshot()[0] == 0:
+                    if target is not None and stats.progress()[0] == 0:
                         break
                     # Transient error; retry after a short delay.
                     log.warning(t("fetch_retry_5s"))
@@ -799,7 +826,8 @@ def run_pipeline(cfg):
     abnormal = []
     try:
         for i, p in enumerate(procs):
-            p.join()
+            while p.is_alive():
+                p.join(timeout=0.5)
             if p.exitcode not in (0, None):
                 abnormal.append((i, p.exitcode))
     except KeyboardInterrupt:
@@ -811,6 +839,7 @@ def run_pipeline(cfg):
                 task_q.put_nowait(None)
             except queue.Full:
                 pass
+        # Wait for workers to finish their current task. 
         for i, p in enumerate(procs):
             p.join(timeout=30)
             if p.is_alive():
@@ -821,8 +850,7 @@ def run_pipeline(cfg):
         for wid, code in abnormal:
             log.warning(t("pipeline_worker_abnormal", wid=wid, code=code))
         time.sleep(0.5)
-        stop_event.set()
-        collector.join(timeout=5)
+        collector.join(timeout=10)
         with in_flight_lock:
             print_stats(stats, len(in_flight), len(recent_done) if recent_done else 0)
         raise
@@ -832,7 +860,7 @@ def run_pipeline(cfg):
 
     # Normal termination: stop the collector and print final stats.
     stop_event.set()
-    collector.join(timeout=5)
+    collector.join(timeout=10)
     with in_flight_lock:
         print_stats(stats, len(in_flight), len(recent_done) if recent_done else 0)
     return stats
